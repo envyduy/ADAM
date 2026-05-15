@@ -1,0 +1,272 @@
+import express from "express";
+import path from "path";
+import { ElevenLabsClient } from "elevenlabs";
+import dotenv from "dotenv";
+
+dotenv.config();
+
+// In-memory API key index (resets on restart - acceptable for stateless backend)
+let currentApiKeyIndex = 1;
+
+async function startServer() {
+  const app = express();
+  const PORT = 3000;
+
+  app.use(express.json());
+
+  // Helper to get all available API keys
+  const getApiKeys = () => {
+    const keys: string[] = [];
+    for (let i = 1; i <= 10; i++) {
+      const key = process.env[`ELEVENLABS_API_KEY_${i}`];
+      if (key && key.trim()) {
+        keys.push(key.trim());
+      }
+    }
+    // Fallback to legacy key if none of the 10 slots are filled
+    if (keys.length === 0 && process.env.ELEVENLABS_API_KEY) {
+      keys.push(process.env.ELEVENLABS_API_KEY.trim());
+    }
+    console.log(`[getApiKeys] Found ${keys.length} API key(s)`);
+    return keys;
+  };
+
+  // Helper to try an operation across multiple keys if needed
+  const withKeyRotation = async (operation: (apiKey: string) => Promise<any>) => {
+    const keys = getApiKeys();
+    if (keys.length === 0) {
+      throw new Error("No ElevenLabs API keys configured. Please add them in environment variables.");
+    }
+
+    let currentIndex = currentApiKeyIndex;
+    // Validate index
+    if (currentIndex < 1 || currentIndex > keys.length) {
+      currentIndex = 1;
+    }
+
+    let attempts = 0;
+    while (attempts < keys.length) {
+      const apiKey = keys[currentIndex - 1];
+      try {
+        const result = await operation(apiKey);
+        // If successful, update this index (in-memory only)
+        currentApiKeyIndex = currentIndex;
+        return result;
+      } catch (error: any) {
+        const errorMsg = error.message?.toLowerCase() || "";
+        const isQuotaError =
+          error.statusCode === 429 ||
+          error.status === 429 ||
+          errorMsg.includes("quota") ||
+          errorMsg.includes("limit") ||
+          errorMsg.includes("credit");
+
+        if (isQuotaError || error.statusCode === 401 || error.status === 401) {
+          // Switch to next key
+          currentIndex = (currentIndex % keys.length) + 1;
+          attempts++;
+          continue;
+        }
+        // Rethrow other errors
+        throw error;
+      }
+    }
+    throw new Error("All API keys exhausted or invalid.");
+  };
+
+  const getElevenLabsClient = (apiKey: string) => {
+    return new ElevenLabsClient({ apiKey });
+  };
+
+  // API Routes
+  app.get("/api/user/subscription", async (req, res) => {
+    try {
+      const subscription = await withKeyRotation(async (apiKey) => {
+        const client = getElevenLabsClient(apiKey);
+        return await client.user.getSubscription();
+      });
+      res.json(subscription);
+    } catch (error: any) {
+      if (error.statusCode === 401 || error.status === 401 || (error.message && error.message.includes("401"))) {
+        return res.status(401).json({ 
+          error: "Invalid ElevenLabs API Keys. Please check your keys in the Settings menu.",
+          isAuthError: true 
+        });
+      }
+      res.status(500).json({ error: error.message || "Failed to fetch subscription" });
+    }
+  });
+
+  app.get("/api/history", async (req, res) => {
+    try {
+      const history = await withKeyRotation(async (apiKey) => {
+        const client = getElevenLabsClient(apiKey);
+        return await client.history.getAll();
+      });
+      res.json(history);
+    } catch (error: any) {
+      res.status(500).json({ error: error.message || "Failed to fetch history" });
+    }
+  });
+
+  app.get("/api/history/:id", async (req, res) => {
+    try {
+      const item = await withKeyRotation(async (apiKey) => {
+        const response = await fetch(
+          `https://api.elevenlabs.io/v1/history/${req.params.id}`,
+          {
+            headers: {
+              "xi-api-key": apiKey,
+            },
+          },
+        );
+        if (!response.ok) {
+          const errorData = await response.json();
+          const detail = errorData.detail?.status || errorData.message || "";
+          
+          const err: any = new Error(detail || "Failed to fetch history item");
+          err.statusCode = response.status;
+          throw err;
+        }
+        return await response.json();
+      });
+      res.json(item);
+    } catch (error: any) {
+      res.status(500).json({
+        error: error.message || "Failed to fetch history item",
+      });
+    }
+  });
+
+  app.get("/api/history/:id/audio", async (req, res) => {
+    try {
+      // For audio retrieval, we try with rotation but we need to handle the response differently
+      // because it's a stream/buffer
+      const audio = await withKeyRotation(async (apiKey) => {
+        const client = getElevenLabsClient(apiKey);
+        return await client.history.getAudio(req.params.id);
+      });
+      
+      res.setHeader("Content-Type", "audio/mpeg");
+      if (audio && typeof (audio as any).pipe === 'function') {
+        (audio as any).pipe(res);
+      } else if (audio && typeof (audio as any)[Symbol.asyncIterator] === 'function') {
+        for await (const chunk of audio as any) {
+          res.write(chunk);
+        }
+        res.end();
+      } else {
+        res.send(Buffer.from(audio as any));
+      }
+    } catch (error: any) {
+      res.status(500).json({ error: error.message || "Failed to fetch audio" });
+    }
+  });
+
+  app.post("/api/tts", async (req, res) => {
+    try {
+      const { text, stability } = req.body;
+
+      if (!text) {
+        return res.status(400).json({ error: "Text is required" });
+      }
+
+      await withKeyRotation(async (apiKey) => {
+        // We use direct fetch to get the history-item-id from headers
+        const response = await fetch(
+          `https://api.elevenlabs.io/v1/text-to-speech/pNInz6obpgDQGcFmaJgB`,
+          {
+            method: "POST",
+            headers: {
+              "Content-Type": "application/json",
+              "xi-api-key": apiKey,
+            },
+            body: JSON.stringify({
+              text,
+              model_id: "eleven_v3",
+              voice_settings: {
+                stability: typeof stability === "number" ? stability : 0.5,
+                similarity_boost: 0.75,
+                speed: 1.1,
+              },
+            }),
+          },
+        );
+
+        if (!response.ok) {
+          const errorData = await response.json();
+          const detail = errorData.detail?.status || errorData.message || "";
+          
+          const err: any = new Error(detail || "TTS failed");
+          err.statusCode = response.status;
+          throw err;
+        }
+
+        const historyItemId = response.headers.get("history-item-id");
+        if (historyItemId) {
+          res.setHeader("x-history-item-id", historyItemId);
+        }
+
+        res.setHeader("Content-Type", "audio/mpeg");
+        
+        // Stream the response body
+        const reader = response.body?.getReader();
+        if (reader) {
+          while (true) {
+            const { done, value } = await reader.read();
+            if (done) break;
+            res.write(value);
+          }
+          res.end();
+        } else {
+          const buffer = await response.arrayBuffer();
+          res.send(Buffer.from(buffer));
+        }
+        return true; // Indicate success to withKeyRotation
+      });
+    } catch (error: any) {
+      res.status(500).json({ error: error.message || "Failed to generate speech" });
+    }
+  });
+
+  // Backend-only API endpoints
+  app.get("/api/key-index", (req, res) => {
+    res.json({ index: currentApiKeyIndex });
+  });
+
+  app.post("/api/rotate-key", (req, res) => {
+    try {
+      const keys = getApiKeys();
+      console.log(`[rotate-key] Available keys: ${keys.length}`);
+      
+      if (keys.length <= 1) {
+        console.log("[rotate-key] Only one key available, returning index 1");
+        return res.json({ index: 1, message: "Only one key available" });
+      }
+      
+      console.log(`[rotate-key] Current index: ${currentApiKeyIndex}`);
+      
+      // Wrap index if it's out of bounds
+      let safeIndex = currentApiKeyIndex;
+      if (safeIndex > keys.length || safeIndex < 1) {
+        safeIndex = 1;
+      }
+      
+      const newIndex = (safeIndex % keys.length) + 1;
+      console.log(`[rotate-key] Calculating: (${safeIndex} % ${keys.length}) + 1 = ${newIndex}`);
+      
+      currentApiKeyIndex = newIndex;
+      console.log(`[rotate-key] Updated index to: ${newIndex}`);
+      
+      res.json({ index: newIndex });
+    } catch (error) {
+      console.error("[rotate-key] Error:", error);
+      res.status(500).json({ error: "Failed to rotate key" });
+    }
+  });
+
+  app.listen(PORT, "0.0.0.0", () => {
+  });
+}
+
+startServer();

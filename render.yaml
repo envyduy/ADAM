@@ -1,0 +1,12 @@
+services:
+  - type: web
+    name: elevenlabs-api
+    env: node
+    plan: free
+    buildCommand: npm install && npm run build
+    startCommand: npm start
+    envVars:
+      - key: NODE_ENV
+        value: production
+      # Add your ElevenLabs API keys in the Render dashboard Environment Variables:
+      # ELEVENLABS_API_KEY_1, ELEVENLABS_API_KEY_2, etc.
