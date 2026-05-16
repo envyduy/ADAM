@@ -183,64 +183,60 @@ async function startServer() {
       }
 
       await withKeyRotation(async (apiKey) => {
-        // We use direct fetch to get the history-item-id from headers
-        const requestBody = {
-          text,
-          model_id: "eleven_v3",
-          voice_settings: {
-            stability: typeof stability === "number" ? stability : 0.5,
-            similarity_boost: 0.75,
-          },
-        };
-
         console.log(`[TTS] Calling API with text length: ${text.length}`);
         
-        const response = await fetch(
-          `https://api.elevenlabs.io/v1/text-to-speech/pNInz6obpgDQGcFmaJgB`,
-          {
-            method: "POST",
-            headers: {
-              "Content-Type": "application/json",
-              "xi-api-key": apiKey,
-            },
-            body: JSON.stringify(requestBody),
-          },
-        );
-
-        console.log(`[TTS] Response status: ${response.status}`);
-
-        if (!response.ok) {
-          const errorData = await response.json().catch(() => ({}));
-          const detail = errorData.detail?.status || errorData.message || errorData.error?.detail || JSON.stringify(errorData);
+        try {
+          const client = getElevenLabsClient(apiKey);
           
-          console.error(`[TTS] API Error - Status ${response.status}: ${detail}`);
+          // Use SDK method instead of fetch
+          const response = await client.textToSpeech.convert(
+            "pNInz6obpgDQGcFmaJgB",
+            {
+              text,
+              modelId: "eleven_v3",
+              voiceSettings: {
+                stability: typeof stability === "number" ? stability : 0.5,
+                similarityBoost: 0.75,
+              },
+            }
+          );
+
+          console.log(`[TTS] Successfully generated audio`);
+
+          res.setHeader("Content-Type", "audio/mpeg");
+          
+          // Handle response - convert to buffer if needed
+          if (response instanceof ReadableStream) {
+            const reader = response.getReader();
+            try {
+              while (true) {
+                const { done, value } = await reader.read();
+                if (done) break;
+                res.write(value);
+              }
+            } finally {
+              reader.releaseLock();
+            }
+            res.end();
+          } else if (Buffer.isBuffer(response)) {
+            res.send(response);
+          } else if (response && typeof response === 'object') {
+            // If it's an object, try to convert to buffer
+            res.send(Buffer.from(response));
+          } else {
+            res.send(response);
+          }
+          return true;
+        } catch (error: any) {
+          const statusCode = error.statusCode || error.status;
+          const detail = error.message || JSON.stringify(error);
+          
+          console.error(`[TTS] SDK Error - Status ${statusCode}: ${detail}`);
           
           const err: any = new Error(detail || "TTS failed");
-          err.statusCode = response.status;
+          err.statusCode = statusCode;
           throw err;
         }
-
-        const historyItemId = response.headers.get("history-item-id");
-        if (historyItemId) {
-          res.setHeader("x-history-item-id", historyItemId);
-        }
-
-        res.setHeader("Content-Type", "audio/mpeg");
-        
-        // Stream the response body
-        const reader = response.body?.getReader();
-        if (reader) {
-          while (true) {
-            const { done, value } = await reader.read();
-            if (done) break;
-            res.write(value);
-          }
-          res.end();
-        } else {
-          const buffer = await response.arrayBuffer();
-          res.send(Buffer.from(buffer));
-        }
-        return true; // Indicate success to withKeyRotation
       });
     } catch (error: any) {
       console.error(`[TTS] Request error: ${error.message}`);
