@@ -1,5 +1,4 @@
 import express from "express";
-import { ElevenLabsClient } from "elevenlabs";
 import dotenv from "dotenv";
 
 dotenv.config();
@@ -35,7 +34,7 @@ async function startServer() {
     return keys;
   };
 
-  // Helper xoay key: mỗi key gọi tối đa 1 lần
+  // Helper xoay key: mỗi key tối đa 1 lần
   const withKeyRotation = async (operation: (apiKey: string) => Promise<any>) => {
     const keys = getApiKeys(); // chỉ gọi 1 lần
     if (keys.length === 0) throw new Error("No ElevenLabs API keys configured.");
@@ -43,7 +42,6 @@ async function startServer() {
     let currentIndex = currentApiKeyIndex;
     if (currentIndex < 1 || currentIndex > keys.length) currentIndex = 1;
 
-    // Thử lần lượt từng key, không retry cùng một key
     for (let attempt = 0; attempt < keys.length; attempt++) {
       const apiKey = keys[currentIndex - 1];
       try {
@@ -62,21 +60,25 @@ async function startServer() {
           currentIndex = (currentIndex % keys.length) + 1;
           continue; // thử key tiếp theo
         }
-        // Lỗi không liên quan đến quota/auth -> ném luôn
-        throw error;
+        throw error; // lỗi khác không retry
       }
     }
     throw new Error("All API keys exhausted or invalid.");
   };
 
-  const getElevenLabsClient = (apiKey: string) => new ElevenLabsClient({ apiKey });
-
   // ==================== API ROUTES ====================
   app.get("/api/user/subscription", async (req, res) => {
     try {
       const sub = await withKeyRotation(async (apiKey) => {
-        const client = getElevenLabsClient(apiKey);
-        return await client.user.getSubscription();
+        const response = await fetch("https://api.elevenlabs.io/v1/user/subscription", {
+          headers: { "xi-api-key": apiKey }
+        });
+        if (!response.ok) {
+          const err: any = new Error(await response.text());
+          err.statusCode = response.status;
+          throw err;
+        }
+        return response.json();
       });
       res.json(sub);
     } catch (error: any) {
@@ -89,8 +91,11 @@ async function startServer() {
   app.get("/api/history", async (req, res) => {
     try {
       const history = await withKeyRotation(async (apiKey) => {
-        const client = getElevenLabsClient(apiKey);
-        return await client.history.getAll();
+        const response = await fetch("https://api.elevenlabs.io/v1/history", {
+          headers: { "xi-api-key": apiKey }
+        });
+        if (!response.ok) throw new Error(await response.text());
+        return response.json();
       });
       res.json(history);
     } catch (error: any) {
@@ -109,7 +114,7 @@ async function startServer() {
           err.statusCode = response.status;
           throw err;
         }
-        return await response.json();
+        return response.json();
       });
       res.json(item);
     } catch (error: any) {
@@ -119,72 +124,73 @@ async function startServer() {
 
   app.get("/api/history/:id/audio", async (req, res) => {
     try {
-      const audio = await withKeyRotation(async (apiKey) => {
-        const client = getElevenLabsClient(apiKey);
-        return await client.history.getAudio(req.params.id);
+      const audioBuffer = await withKeyRotation(async (apiKey) => {
+        const response = await fetch(`https://api.elevenlabs.io/v1/history/${req.params.id}/audio`, {
+          headers: { "xi-api-key": apiKey }
+        });
+        if (!response.ok) throw new Error(await response.text());
+        return Buffer.from(await response.arrayBuffer());
       });
       res.setHeader("Content-Type", "audio/mpeg");
-      if (audio && typeof audio.pipe === 'function') {
-        audio.pipe(res);
-      } else if (audio && typeof audio[Symbol.asyncIterator] === 'function') {
-        for await (const chunk of audio) res.write(chunk);
-        res.end();
-      } else {
-        res.send(Buffer.from(audio as any));
-      }
+      res.send(audioBuffer);
     } catch (error: any) {
       res.status(500).json({ error: error.message || "Failed to fetch audio" });
     }
   });
 
-  // ===== QUAN TRỌNG: Route TTS đã được sửa để không gửi response trong callback =====
+  // ==================== QUAN TRỌNG: /api/tts dùng fetch ====================
   app.post("/api/tts", async (req, res) => {
     const { text, stability = 0.5 } = req.body;
     if (!text) return res.status(400).json({ error: "Text is required" });
 
     try {
-      // Gọi withKeyRotation, nhận về buffer audio
       const audioBuffer = await withKeyRotation(async (apiKey) => {
         console.log(`[TTS] Trying key starting with ${apiKey.slice(0,5)}...`);
-        const client = getElevenLabsClient(apiKey);
+        
+        const requestBody = JSON.stringify({
+          text,
+          model_id: "eleven_v3",            // thử đổi thành "eleven_monolingual_v1" nếu free
+          voice_settings: {
+            stability,
+            similarity_boost: 0.75,
+          },
+        });
 
-        // Sử dụng SDK, nhưng chú ý response có thể là stream hoặc buffer
-        const response = await client.textToSpeech.convert(
-          "pNInz6obpgDQGcFmaJgB",  // voice ID
+        const response = await fetch(
+          "https://api.elevenlabs.io/v1/text-to-speech/pNInz6obpgDQGcFmaJgB", // voice ID
           {
-            text,
-            model_id: "eleven_v3",
-            voice_settings: { stability, similarity_boost: 0.75 },
+            method: "POST",
+            headers: {
+              "Content-Type": "application/json",
+              "xi-api-key": apiKey,
+              "User-Agent": "RenderBackend/1.0",
+            },
+            body: requestBody,
           }
         );
 
-        // Gom tất cả chunk thành buffer
-        const chunks: Buffer[] = [];
-        if (response && typeof response[Symbol.asyncIterator] === 'function') {
-          for await (const chunk of response as any) {
-            chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
-          }
-        } else if (Buffer.isBuffer(response)) {
-          chunks.push(response);
-        } else if (response instanceof Uint8Array) {
-          chunks.push(Buffer.from(response));
-        } else {
-          chunks.push(Buffer.from(response as any));
+        // Log chi tiết khi lỗi
+        if (!response.ok) {
+          const errorText = await response.text();
+          console.error(`[TTS] ElevenLabs error ${response.status}: ${errorText}`);
+          const err: any = new Error(errorText || `HTTP ${response.status}`);
+          err.statusCode = response.status;
+          throw err;
         }
-        return Buffer.concat(chunks);
+
+        const arrayBuffer = await response.arrayBuffer();
+        return Buffer.from(arrayBuffer);
       });
 
-      // Gửi response thành công
       res.setHeader("Content-Type", "audio/mpeg");
       res.send(audioBuffer);
     } catch (error: any) {
       console.error(`[TTS] Final error: ${error.message}`);
-      // Không retry, trả về lỗi ngay
       res.status(500).json({ error: error.message || "TTS failed" });
     }
   });
 
-  // Các endpoint phụ
+  // Backend endpoints
   app.get("/api/key-index", (req, res) => res.json({ index: currentApiKeyIndex }));
   app.post("/api/rotate-key", (req, res) => {
     const keys = getApiKeys();
