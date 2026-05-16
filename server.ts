@@ -193,10 +193,10 @@ async function startServer() {
             "pNInz6obpgDQGcFmaJgB",
             {
               text,
-              modelId: "eleven_v3",
-              voiceSettings: {
+              model_id: "eleven_v3",
+              voice_settings: {
                 stability: typeof stability === "number" ? stability : 0.5,
-                similarityBoost: 0.75,
+                similarity_boost: 0.75,
               },
             }
           );
@@ -205,27 +205,24 @@ async function startServer() {
 
           res.setHeader("Content-Type", "audio/mpeg");
           
-          // Handle response - convert to buffer if needed
-          if (response instanceof ReadableStream) {
-            const reader = response.getReader();
-            try {
-              while (true) {
-                const { done, value } = await reader.read();
-                if (done) break;
-                res.write(value);
-              }
-            } finally {
-              reader.releaseLock();
+          // Convert response to buffer
+          const chunks: Buffer[] = [];
+          
+          if (response && typeof response[Symbol.asyncIterator] === 'function') {
+            // Async iterable
+            for await (const chunk of response as any) {
+              chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
             }
-            res.end();
           } else if (Buffer.isBuffer(response)) {
-            res.send(response);
-          } else if (response && typeof response === 'object') {
-            // If it's an object, try to convert to buffer
-            res.send(Buffer.from(response));
+            chunks.push(response);
+          } else if (response instanceof Uint8Array) {
+            chunks.push(Buffer.from(response));
           } else {
-            res.send(response);
+            chunks.push(Buffer.from(response as any));
           }
+          
+          const finalBuffer = Buffer.concat(chunks);
+          res.send(finalBuffer);
           return true;
         } catch (error: any) {
           const statusCode = error.statusCode || error.status;
