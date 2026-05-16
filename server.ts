@@ -184,6 +184,17 @@ async function startServer() {
 
       await withKeyRotation(async (apiKey) => {
         // We use direct fetch to get the history-item-id from headers
+        const requestBody = {
+          text,
+          model_id: "eleven_v3",
+          voice_settings: {
+            stability: typeof stability === "number" ? stability : 0.5,
+            similarity_boost: 0.75,
+          },
+        };
+
+        console.log(`[TTS] Calling API with text length: ${text.length}`);
+        
         const response = await fetch(
           `https://api.elevenlabs.io/v1/text-to-speech/pNInz6obpgDQGcFmaJgB`,
           {
@@ -192,21 +203,17 @@ async function startServer() {
               "Content-Type": "application/json",
               "xi-api-key": apiKey,
             },
-            body: JSON.stringify({
-              text,
-              model_id: "eleven_v3",
-              voice_settings: {
-                stability: typeof stability === "number" ? stability : 0.5,
-                similarity_boost: 0.75,
-                speed: 1.1,
-              },
-            }),
+            body: JSON.stringify(requestBody),
           },
         );
 
+        console.log(`[TTS] Response status: ${response.status}`);
+
         if (!response.ok) {
-          const errorData = await response.json();
-          const detail = errorData.detail?.status || errorData.message || "";
+          const errorData = await response.json().catch(() => ({}));
+          const detail = errorData.detail?.status || errorData.message || errorData.error?.detail || JSON.stringify(errorData);
+          
+          console.error(`[TTS] API Error - Status ${response.status}: ${detail}`);
           
           const err: any = new Error(detail || "TTS failed");
           err.statusCode = response.status;
@@ -236,6 +243,7 @@ async function startServer() {
         return true; // Indicate success to withKeyRotation
       });
     } catch (error: any) {
+      console.error(`[TTS] Request error: ${error.message}`);
       res.status(500).json({ error: error.message || "Failed to generate speech" });
     }
   });
